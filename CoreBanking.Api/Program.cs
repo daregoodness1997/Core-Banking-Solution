@@ -1,36 +1,43 @@
-using Microsoft.EntityFrameworkCore;
-using CoreBanking.Infrastructure.Persistence;
-using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
-using Microsoft.AspNetCore.Identity;
-using Microsoft.OpenApi.Models;
-using Microsoft.AspNetCore.Identity.Data;
-using Microsoft.AspNetCore.Mvc;
-using CoreBanking.DTOs;
+using CoreBanking.Api.Extensions;
 using CoreBanking.Api.Swagger;
-using CoreBanking.Domain.Entities;
-using CoreBanking.Infrastructure.Repository;
-using CoreBanking.Application.Services;
-using CoreBanking.Infrastructure.Identity;
-using System.Text;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.IdentityModel.Tokens;
-using System.Text.Json.Serialization;
-using System.Security.Claims;
+using CoreBanking.Application.Common;
 using CoreBanking.Application.Identity;
+using CoreBanking.Application.Interfaces.IMailServices;
 using CoreBanking.Application.Interfaces.IRepository;
 using CoreBanking.Application.Interfaces.IServices;
-using System.Net.Mail;
-using System.Net;
-using CoreBanking.Api.Extensions;
-using CoreBanking.Infrastructure.Configuration;
-using Microsoft.Extensions.Configuration;
-using CoreBanking.Infrastructure.EmailServices;
-using CoreBanking.Infrastructure.Services;
-using Microsoft.Extensions.Options;
-using MediatR;
-using CoreBanking.Application.Interfaces.IMailServices;
 using CoreBanking.Application.Security;
-using CoreBanking.Application.Common;
+using CoreBanking.Application.Services;
+using CoreBanking.Application.Shared;
+using CoreBanking.Domain.Entities;
+using CoreBanking.DTOs;
+using CoreBanking.Infrastructure.Configuration;
+using CoreBanking.Infrastructure.EmailServices;
+using CoreBanking.Infrastructure.Identity;
+using CoreBanking.Infrastructure.Messaging.Consumer;
+using CoreBanking.Infrastructure.Persistence;
+using CoreBanking.Infrastructure.Repository;
+using CoreBanking.Infrastructure.Services;
+using MediatR;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Identity.Data;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
+using RabbitMQ.Client;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Mail;
+using System.Security.Claims;
+using System.Text;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using CoreBanking.Infrastructure.Messaging.Consumers;
 
 // Load .env file into environment variables (must be before builder creation)
 var envPath = Path.Combine(AppContext.BaseDirectory, ".env");
@@ -50,6 +57,11 @@ if (File.Exists(envPath))
 }
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.Configure<HostOptions>(options =>
+{
+    options.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
+});
 
 // Add services to the container.
 
@@ -89,6 +101,33 @@ builder.Services.AddScoped<IEmailSenderr, EmailSender>();
 builder.Services.AddScoped(sp =>
     new EmailTemplateService(builder.Environment.ContentRootPath));
 
+var baseUrl = builder.Configuration["Monnify:BaseUrl"];
+if (string.IsNullOrEmpty(baseUrl))
+{
+    throw new Exception("Monnify:BaseUrl is not configured in appsettings.json");
+}
+
+builder.Services.AddHttpClient<IMonnifyService, MonnifyService>(client =>
+{
+    client.BaseAddress = new Uri(baseUrl);
+    Console.WriteLine("HttpClient BaseAddress: " + client.BaseAddress);
+});
+
+var paystackBaseUrl = builder.Configuration["Paystack:BaseUrl"];
+Console.WriteLine("Paystack HttpClient BaseAddress: " + paystackBaseUrl);
+
+// Register PaystackService with HttpClient and BaseAddress
+builder.Services.AddHttpClient<IPayStackService, PaystackService>((sp, client) =>
+{
+    var settings = sp.GetRequiredService<IOptions<PaystackSettings>>().Value;
+
+    client.BaseAddress = new Uri(settings.BaseUrl);
+    client.DefaultRequestHeaders.Authorization =
+        new AuthenticationHeaderValue("Bearer", settings.SecretKey);
+});
+
+
+
 builder.Services.AddScoped<IBankingDbContext>(provider => provider.GetRequiredService<CoreBankingDbContext>());
 builder.Services.AddScoped<IEmailTemplateService>(provider => provider.GetRequiredService<EmailTemplateService>());
 builder.Services.AddScoped<ICodeHasher>(provider => provider.GetRequiredService<CodeHasher>());
@@ -102,6 +141,13 @@ builder.Services.AddScoped<ITransactionPinService, TransactionPinService>();
 builder.Services.AddScoped<ITransactionEmailService, TransactionEmailService>();
 builder.Services.AddScoped<ICodeHasher, CodeHasher>();
 builder.Services.AddScoped<IPinValidationService, PinValidationService>();
+builder.Services.AddHostedService<RegistrationConsumer>();
+builder.Services.AddMassTransitServices(builder.Configuration); // MassTransit config
+//builder.Services.AddHttpClient<IVirtualAccountService, PaystackService>();
+builder.Services.Configure<PaystackSettings>(
+    builder.Configuration.GetSection("Paystack"));
+
+
 
 
 
@@ -115,13 +161,15 @@ builder.Services.Configure<AdminSettings>(
 builder.Services.Configure<JwtSettings>(
     builder.Configuration.GetSection("JwtSettings"));
 
-var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>() ?? new JwtSettings
-{
-    Key = "DefaultSuperSecretKeyForDevelopment!",
-    Issuer = "CoreBanking",
-    Audience = "CoreBankingUsers",
-    DurationInMinutes = 60
-};
+var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>() ?? new JwtSettings();
+if (string.IsNullOrEmpty(jwtSettings.Key))
+    jwtSettings.Key = "DefaultSuperSecretKeyForDevelopment!";
+if (string.IsNullOrEmpty(jwtSettings.Issuer))
+    jwtSettings.Issuer = "CoreBanking";
+if (string.IsNullOrEmpty(jwtSettings.Audience))
+    jwtSettings.Audience = "CoreBankingUsers";
+if (jwtSettings.DurationInMinutes <= 0)
+    jwtSettings.DurationInMinutes = 60;
 var key = Encoding.UTF8.GetBytes(jwtSettings.Key);
 
 builder.Services.AddFluentEmailConfiguration(builder.Configuration);
@@ -181,6 +229,62 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
+app.MapPost("/api/customerrs", async (CustomerDto dto) =>
+{
+    var factory = new ConnectionFactory()
+    {
+        HostName = "localhost",
+        UserName = "guest",
+        Password = "guest",
+        Port = 5672
+    };
+
+    // await async connection
+    await using var connection = await factory.CreateConnectionAsync();
+    await using var channel = await connection.CreateChannelAsync();
+
+    await channel.ExchangeDeclareAsync(
+        exchange: "corebank.exchange",
+        type: ExchangeType.Direct,
+        durable: true
+    );
+
+    await channel.QueueDeclareAsync(
+        queue: "registration.queue",
+        durable: true,
+        exclusive: false,
+        autoDelete: false
+    );
+
+    await channel.QueueBindAsync(
+        queue: "registration.queue",
+        exchange: "corebank.exchange",
+        routingKey: "registration.create"
+    );
+
+    var message = new CustomerCreatedMessage(
+        dto.FirstName,
+        dto.LastName,
+        dto.Email,
+        dto.Password,
+        dto.ConfirmPassword,
+        dto.PhoneNumber
+    );
+
+    var json = JsonSerializer.Serialize(message);
+    var body = Encoding.UTF8.GetBytes(json);
+
+    await channel.BasicPublishAsync(
+         exchange: "corebank.exchange",
+         routingKey: "registration.create",
+         mandatory: false,
+         body: body,
+        cancellationToken: CancellationToken.None
+    );
+
+    return Results.Accepted();
+});
+
 
 using (var scope = app.Services.CreateScope())
 {
@@ -217,4 +321,12 @@ authGroup.MapIdentityApi<Customer>();
 
 app.MapControllers();
 
+var addresses = app.Urls;
+foreach (var address in addresses)
+{
+    Console.WriteLine($"App listening on: {address}");
+}
+
 app.Run();
+public record CustomerDto(string FirstName, string LastName, string Email, string Password, string ConfirmPassword, string PhoneNumber);
+public record CustomerCreatedMessage(string FirstName, string LastName, string Email, string Password, string ConfirmPassword, string PhoneNumber);
