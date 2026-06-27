@@ -12,7 +12,7 @@ namespace CoreBanking.Api.Extensions
         {
             var emailConfig = configuration
                 .GetSection("EmailConfiguration")
-                .Get<EmailConfiguration>();
+                .Get<EmailConfiguration>() ?? new EmailConfiguration();
 
             services.AddSingleton(emailConfig);
             return services;

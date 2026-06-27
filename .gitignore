@@ -1,0 +1,44 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.sln.docstates
+*.csproj.user
+*.dbmdl
+*.jfm
+*.nupkg
+packages/
+*.nuget.props
+*.nuget.targets
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# User secrets
+appsettings.*.local.json
+secrets.json
+.env
+
+# Logs & temp
+logs/
+*.log
+tmp/
+
+# Docker
+docker-compose.override.yml
+
+# Coverage
+coverage/
+*.coverage

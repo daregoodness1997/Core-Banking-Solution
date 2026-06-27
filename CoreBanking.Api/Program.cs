@@ -32,7 +32,22 @@ using CoreBanking.Application.Interfaces.IMailServices;
 using CoreBanking.Application.Security;
 using CoreBanking.Application.Common;
 
-
+// Load .env file into environment variables (must be before builder creation)
+var envPath = Path.Combine(AppContext.BaseDirectory, ".env");
+if (!File.Exists(envPath))
+    envPath = Path.Combine(Directory.GetCurrentDirectory(), ".env");
+if (File.Exists(envPath))
+{
+    foreach (var line in File.ReadAllLines(envPath))
+    {
+        var trimmed = line.Trim();
+        if (trimmed.Length == 0 || trimmed[0] == '#')
+            continue;
+        var eq = trimmed.IndexOf('=');
+        if (eq > 0)
+            Environment.SetEnvironmentVariable(trimmed[..eq].Trim(), trimmed[(eq + 1)..].Trim().Trim('"'));
+    }
+}
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -51,7 +66,7 @@ builder.Services.AddScoped<IEmailSenderr, EmailSender>();
 builder.Services.AddIdentityApiEndpoints<Customer>()
     .AddRoles<IdentityRole>()
     .AddEntityFrameworkStores<CoreBankingDbContext>()
-    .AddDefaultTokenProviders(); 
+    .AddDefaultTokenProviders();
 /*builder.Services.AddIdentity<Customer, IdentityRole>()
     .AddEntityFrameworkStores<CoreBankingDbContext>()
     .AddDefaultTokenProviders();  */
@@ -100,7 +115,13 @@ builder.Services.Configure<AdminSettings>(
 builder.Services.Configure<JwtSettings>(
     builder.Configuration.GetSection("JwtSettings"));
 
-var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>();
+var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>() ?? new JwtSettings
+{
+    Key = "DefaultSuperSecretKeyForDevelopment!",
+    Issuer = "CoreBanking",
+    Audience = "CoreBankingUsers",
+    DurationInMinutes = 60
+};
 var key = Encoding.UTF8.GetBytes(jwtSettings.Key);
 
 builder.Services.AddFluentEmailConfiguration(builder.Configuration);
@@ -164,6 +185,9 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var services = scope.ServiceProvider;
+
+    var context = services.GetRequiredService<CoreBankingDbContext>();
+    await context.Database.MigrateAsync();
 
     var userManager = services.GetRequiredService<UserManager<Customer>>();
     var roleManager = services.GetRequiredService<RoleManager<IdentityRole>>();

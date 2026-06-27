@@ -10,8 +10,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using MailKit.Net.Smtp;
-using MimeKit;
 using CoreBanking.Infrastructure.EmailServices;
 using SendGrid.Helpers.Mail;
 using SendGrid;
